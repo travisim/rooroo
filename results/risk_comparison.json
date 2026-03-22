@@ -1,0 +1,46 @@
+[
+  {
+    "sortino": 1.522155320009161,
+    "sharpe": 1.31225717270267,
+    "calmar": 1.897028528068517,
+    "composite": 1.5716478382350205,
+    "max_drawdown": 0.13260230105583443,
+    "total_return": 0.2523199727434787,
+    "trades_per_day": 0.9068493150684932,
+    "n_trades": 331,
+    "label": "A. Fixed 25%"
+  },
+  {
+    "sortino": 1.4899219226153217,
+    "sharpe": 1.2848040607356614,
+    "calmar": 1.8304986373735816,
+    "composite": 1.5305595784789017,
+    "max_drawdown": 0.1526728978934867,
+    "total_return": 0.28033170572272986,
+    "trades_per_day": 0.9068493150684932,
+    "n_trades": 331,
+    "label": "B. Fixed 30% (baseline)"
+  },
+  {
+    "sortino": 1.4125397635297288,
+    "sharpe": 1.2214425881177988,
+    "calmar": 1.6789224939260814,
+    "composite": 1.4351254300250555,
+    "max_drawdown": 0.18778347096369696,
+    "total_return": 0.3162617823893208,
+    "trades_per_day": 0.9068493150684932,
+    "n_trades": 331,
+    "label": "C. Fixed 40%"
+  },
+  {
+    "sortino": 1.4389838391337524,
+    "sharpe": 1.2355225089464885,
+    "calmar": 1.7166421639848561,
+    "composite": 1.4612429375329044,
+    "max_drawdown": 0.17521065903332292,
+    "total_return": 0.30171146814439503,
+    "trades_per_day": 0.9068493150684932,
+    "n_trades": 331,
+    "label": "D. Dynamic ATR"
+  }
+]

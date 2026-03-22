@@ -37,7 +37,7 @@ VEC_RSI_ATR_THRESHOLD = 0.8    # above → VEC; below → RSI (sweep optimised)
 TARGET_RISK_PCT = 0.02          # Risk 2% of portfolio per trade
 ATR_SL_MULT = 2.0               # Stop loss = N × ATR(14) below entry
 ATR_PERIOD = 14                 # ATR lookback for sizing and stop-loss
-MAX_POSITION_PCT = 0.40         # Hard cap: max 40% of portfolio per position
+MAX_POSITION_PCT = 0.20         # Hard cap: 20% of portfolio per position (backtest-optimal)
 TAKE_PROFIT_PCT = None          # None = rely on exit signal
 FIXED_SL_PCT = 0.03             # Fixed 3% stop loss (matches backtest sl_stop=0.03)
 
