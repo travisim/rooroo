@@ -1,0 +1,3 @@
+# Additional packages to install in the vbtpro conda environment
+# Run: conda run -n vbtpro pip install -r requirements_vbt.txt
+python-dotenv==1.1.0

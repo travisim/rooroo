@@ -1,0 +1,46 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// TEST STRATEGY — Roostoo Webhook Connectivity Test
+// Fires a BUY on every bar close when flat, exits next bar. Fast test cycle.
+// Use on 15m chart — trades every 2 bars (30 min round trip).
+//@version=6
+strategy(
+    title = "Roostoo Webhook Test Strategy",
+    shorttitle = "Roostoo Test",
+    overlay = true,
+    initial_capital = 1000000,
+    currency = currency.USD,
+    default_qty_type = strategy.fixed,
+    default_qty_value = 1,
+    pyramiding = 0,
+    process_orders_on_close = true,
+    calc_on_every_tick = false
+    )
+
+// ─── INPUTS ───────────────────────────────────────────────
+testPair = input.string(defval = "BTC/USD", title = "Test Pair", options = ["BTC/USD", "ETH/USD", "BNB/USD", "LTC/USD"])
+testQty = input.float(defval = 10, title = "Test Quantity (USD)", minval = 1, tooltip = "Small USD amount for test trades")
+
+// ─── LOGIC ────────────────────────────────────────────────
+qtyStr = str.tostring(testQty)
+isFlat = strategy.position_size == 0
+inPosition = strategy.position_size != 0
+
+// Enter every bar when flat, exit next bar
+if isFlat
+    strategy.entry("Test Long", strategy.long, alert_message = '{"secret":"rooroo-tv-webhook-2024","signal":"LONG_ENTRY","pair":"' + testPair + '","quantity":"' + qtyStr + '","order_type":"MARKET"}')
+    label.new(bar_index, low, "TEST BUY", color = color.lime, style = label.style_label_up, size = size.tiny)
+
+if inPosition
+    strategy.close("Test Long", alert_message = '{"secret":"rooroo-tv-webhook-2024","signal":"LONG_EXIT","pair":"' + testPair + '","quantity":"' + qtyStr + '","order_type":"MARKET"}')
+    label.new(bar_index, high, "TEST EXIT", color = color.gray, size = size.tiny)
+
+// ─── INFO TABLE ───────────────────────────────────────────
+var table infoTable = table.new(position.top_right, 2, 4, color.rgb(50, 50, 50, 20), color.white, 1)
+table.cell(infoTable, 0, 0, "Mode", text_color = color.white)
+table.cell(infoTable, 1, 0, "FAST TEST", text_color = color.yellow)
+table.cell(infoTable, 0, 1, "Pair", text_color = color.white)
+table.cell(infoTable, 1, 1, testPair, text_color = color.white)
+table.cell(infoTable, 0, 2, "Qty (USD)", text_color = color.white)
+table.cell(infoTable, 1, 2, qtyStr, text_color = color.white)
+table.cell(infoTable, 0, 3, "Trades", text_color = color.white)
+table.cell(infoTable, 1, 3, str.tostring(strategy.closedtrades), text_color = color.green)

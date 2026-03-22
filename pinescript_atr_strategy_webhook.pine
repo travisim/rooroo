@@ -1,0 +1,186 @@
+import TradingView/ta/12
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © lahonglam — Modified for Roostoo SPOT-ONLY webhook trading
+// ATR Trend Strategy with Moving Average — LONG ONLY (Spot)
+// Shorts replaced with: exit long on downtrend, re-enter on next uptrend.
+//@version=6
+strategy(
+    title = "ATR Trend Strategy | Roostoo Spot LONG ONLY",
+    shorttitle = "ATR MA Spot Long",
+    overlay = true,
+    initial_capital = 1000000,
+    currency = currency.USD,
+    default_qty_type = strategy.percent_of_equity,
+    default_qty_value = 50,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.04,
+    slippage = 2,
+    pyramiding = 0,
+    calc_on_order_fills = false,
+    process_orders_on_close = true,
+    calc_on_every_tick = false
+    )
+
+// ─── GROUPS ───────────────────────────────────────────────
+MA = "Moving Average"
+ATR = "ATR Signal"
+Thresh = "Threshold (%)"
+BarsConf = "Number Bars Confirmed"
+WEBHOOK = "Webhook Settings"
+
+// ─── WEBHOOK INPUTS ───────────────────────────────────────
+webhookPair = input.string(
+    defval = "BTC/USD",
+    title = "Trading Pair",
+    options = ["BTC/USD", "ETH/USD", "BNB/USD", "LTC/USD", "SOL/USD", "DOGE/USD", "XRP/USD", "ADA/USD", "AVAX/USD", "DOT/USD", "LINK/USD", "SUI/USD"],
+    group = WEBHOOK,
+    display = display.none
+    )
+webhookQty = input.float(
+    defval = 500000,
+    title = "Order Quantity (USD value)",
+    minval = 1,
+    group = WEBHOOK,
+    display = display.none
+    )
+
+// ─── MA INPUTS ────────────────────────────────────────────
+MAtype = input.string(defval = "EMA", title = "MA Type", options = ["EMA", "SMA", "WMA", "Hull MA", "VWMA", "RMA", "TEMA"], group = MA, display = display.none)
+MAlen = input.int(defval = 100, title = "MA Length", group = MA, display = display.none)
+MAsrc = input.source(defval = close, title = "MA Source", group = MA, display = display.none)
+
+// ─── ATR INPUTS ───────────────────────────────────────────
+ATRtype = input.string(defval = "RMA", title = "ATR Type", group = ATR, options = ["EMA", "SMA", "WMA", "RMA"], display = display.none)
+ATRmult = input.float(defval = 3, title = "ATR Multiplier", group = ATR, display = display.none)
+ATRlen = input.int(defval = 7, title = "ATR Length", group = ATR, display = display.none)
+
+// ─── BARS CONFIRMED INPUTS ───────────────────────────────
+ConfirmBars = input.int(defval = 1, title = "Bars Confirmed", tooltip = "Number of bars required beyond the ATR band to confirm a trend. Higher values reduce noise but delay signals.", minval = 1, step = 1, group = BarsConf, display = display.none)
+ConfirmSrc = input.string(defval = "Close", title = "Source Confirmed", options = ["Close", "Low/high"], group = BarsConf, display = display.none)
+
+// ─── THRESHOLD INPUTS ────────────────────────────────────
+entryMethod = input.string(defval = "Breakout", title = "Entry Method", options = ["Breakout", "MA Cross"], tooltip = "Choose the entry method: breakout of the ATR band or pullback entry using a Moving Average cross.", group = Thresh, display = display.none)
+TPthresh = input.float(defval = 5.0, title = "Take Profit (%)", minval = 0.1, step = 0.1, group = Thresh, display = display.none)
+SLthresh = input.float(defval = 2.0, title = "Stop Loss (%)", minval = 0.1, step = 0.1, group = Thresh, display = display.none)
+
+// ─── MA & ATR CALCULATION ─────────────────────────────────
+MAselect(_source, _lockback, _type) =>
+    switch _type
+        "EMA" => ta.ema(_source, _lockback)
+        "SMA" => ta.sma(_source, _lockback)
+        "WMA" => ta.wma(_source, _lockback)
+        "Hull MA" => ta.hma(_source, _lockback)
+        "VWMA" => ta.vwma(_source, _lockback)
+        "RMA" => ta.rma(_source, _lockback)
+        "TEMA" => ta.tema(_source, _lockback)
+
+MAtmp = MAselect(MAsrc, MAlen, MAtype)
+TR = ta.tr(true)
+ATRtmp = MAselect(TR, ATRlen, ATRtype)
+float MAval = MAtmp[1]
+float ATRval = ATRtmp[1]
+ATRupper = MAval + ATRval * ATRmult
+ATRlower = MAval - ATRval * ATRmult
+
+plot(MAval, title = "MA Line", color = color.blue, linewidth = 1)
+plotATRupper = plot(ATRupper, title = "ATR Upper", color = color.green, linewidth = 1)
+plotATRlower = plot(ATRlower, title = "ATR Lower", color = color.red, linewidth = 1)
+
+// ─── TREND DETECTION ──────────────────────────────────────
+var int trend = 0
+breakPoint = 0
+uptrendPrice = ConfirmSrc == "Close" ? close : high
+downtrendPrice = ConfirmSrc == "Close" ? close : low
+isUptrendRaw = uptrendPrice > ATRupper
+isDowntrendRaw = downtrendPrice < ATRlower
+isUptrendConfirmed = ta.barssince(not isUptrendRaw) == ConfirmBars
+isDowntrendConfirmed = ta.barssince(not isDowntrendRaw) == ConfirmBars
+var crossUsed = false
+
+if isUptrendConfirmed and trend != 1
+    trend := 1
+    breakPoint := 1
+    crossUsed := false
+if isDowntrendConfirmed and trend != -1
+    trend := -1
+    breakPoint := -1
+    crossUsed := false
+
+uptrendBg = color.new(color.green, 80)
+downtrendBg = color.new(color.red, 80)
+NeutralBg = color.new(color.gray, 80)
+fill(plotATRupper, plotATRlower, color = trend == 1 ? uptrendBg : trend == -1 ? downtrendBg : NeutralBg)
+
+// ─── LONG-ONLY ENTRIES WITH WEBHOOK ───────────────────────
+offset = 100 * syminfo.mintick
+qtyStr = str.tostring(webhookQty)
+
+if entryMethod == "Breakout"
+    // BUY on uptrend breakout
+    if breakPoint == 1 and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, alert_message = '{"secret":"rooroo-tv-webhook-2024","signal":"LONG_ENTRY","pair":"' + webhookPair + '","quantity":"' + qtyStr + '","order_type":"MARKET"}')
+        label.new(bar_index, low - offset, "Br Long", color = color.green, style = label.style_label_up, size = size.normal)
+    // EXIT long on downtrend breakout (instead of shorting)
+    if breakPoint == -1 and strategy.position_size > 0
+        strategy.close("Long", alert_message = '{"secret":"rooroo-tv-webhook-2024","signal":"LONG_EXIT","pair":"' + webhookPair + '","quantity":"' + qtyStr + '","order_type":"MARKET"}')
+        label.new(bar_index, high + offset, "Exit Long", color = color.orange, size = size.normal)
+
+crossUnder = ta.crossunder(close, MAval)
+crossOver = ta.crossover(close, MAval)
+
+if entryMethod == "MA Cross" and not crossUsed
+    // BUY on pullback in uptrend
+    if trend == 1 and crossUnder and strategy.position_size == 0
+        strategy.entry("Long", strategy.long, alert_message = '{"secret":"rooroo-tv-webhook-2024","signal":"LONG_ENTRY","pair":"' + webhookPair + '","quantity":"' + qtyStr + '","order_type":"MARKET"}')
+        crossUsed := true
+        label.new(bar_index, low - offset, "Cr Long", color = color.green, style = label.style_label_up, size = size.normal)
+    // EXIT long on crossover in downtrend (instead of shorting)
+    if trend == -1 and crossOver and strategy.position_size > 0
+        strategy.close("Long", alert_message = '{"secret":"rooroo-tv-webhook-2024","signal":"LONG_EXIT","pair":"' + webhookPair + '","quantity":"' + qtyStr + '","order_type":"MARKET"}')
+        crossUsed := true
+        label.new(bar_index, high + offset, "Exit Long", color = color.orange, size = size.normal)
+
+// ─── TP/SL — LONG ONLY ───────────────────────────────────
+longTP = strategy.position_avg_price * (1 + TPthresh / 100)
+longSL = strategy.position_avg_price * (1 - SLthresh / 100)
+
+strategy.exit("Long Exit", "Long", limit = longTP, stop = longSL, alert_message = '{"secret":"rooroo-tv-webhook-2024","signal":"LONG_EXIT","pair":"' + webhookPair + '","quantity":"' + qtyStr + '","order_type":"MARKET"}')
+
+// ─── TP/SL BOX ────────────────────────────────────────────
+var box longBox = na
+if strategy.position_size > 0 and na(longBox)
+    longBox := box.new(bar_index, longTP, bar_index, longSL, border_width = 0, bgcolor = color.new(color.blue, 80))
+if not na(longBox)
+    box.set_right(longBox, bar_index)
+if strategy.position_size == 0
+    longBox := na
+
+// ─── TRADE ANALYTICS PANEL ───────────────────────────────
+var table statsTable = table.new(position.top_right, 2, 7, color.rgb(0, 255, 255, 30), color.black, 2)
+totalTrades = strategy.closedtrades
+wintrades = strategy.wintrades
+lossTrades = strategy.losstrades
+netProfit = strategy.netprofit_percent
+profitFactor = strategy.grossprofit / math.abs(strategy.grossloss)
+winRate = totalTrades > 0 ? (wintrades / totalTrades) * 100 : na
+avgWin = wintrades > 0 ? strategy.grossprofit / wintrades : na
+avgLoss = lossTrades > 0 ? math.abs(strategy.grossloss) / lossTrades : na
+lossRate = 100 - winRate
+expectancy = (winRate / 100 * avgWin) - (lossRate / 100 * avgLoss)
+avgR = avgWin / avgLoss
+maxDDpct = strategy.max_drawdown_percent
+
+table.cell(statsTable, 0, 0, "Total Trades")
+table.cell(statsTable, 1, 0, str.tostring(totalTrades))
+table.cell(statsTable, 0, 1, "Win Rate")
+table.cell(statsTable, 1, 1, str.tostring(winRate, "#.##") + "%")
+table.cell(statsTable, 0, 2, "Profit Factor")
+table.cell(statsTable, 1, 2, str.tostring(profitFactor, "#.##"))
+table.cell(statsTable, 0, 3, "Net Profit")
+table.cell(statsTable, 1, 3, str.tostring(netProfit, "#.##") + "%")
+table.cell(statsTable, 0, 4, "Expectancy")
+table.cell(statsTable, 1, 4, str.tostring(expectancy, "#.##"))
+table.cell(statsTable, 0, 5, "Avg R")
+table.cell(statsTable, 1, 5, str.tostring(avgR, "#.##"))
+table.cell(statsTable, 0, 6, "Max Drawdown")
+table.cell(statsTable, 1, 6, str.tostring(maxDDpct, "#.##") + "%")
