@@ -5,7 +5,7 @@
 set -e
 
 EC2_HOST="ubuntu@ec2-3-104-220-58.ap-southeast-2.compute.amazonaws.com"
-PEM_KEY="/Users/travis/Downloads/Sydney.pem"
+PEM_KEY="${SYDNEY_PEM:-$HOME/Downloads/Sydney.pem}"
 REMOTE_DIR="/home/ubuntu/rooroo"
 
 echo "=== Deploying Roostoo Trading Bot ==="
