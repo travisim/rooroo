@@ -21,7 +21,7 @@ import pandas as pd
 import vectorbtpro as vbt
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from backtest.sweep import compute_metrics
+from backtest.sweep import compute_metrics, _strategy_params
 from bot.indicators import compute_signals
 
 DATA_DIR = Path(__file__).parent.parent / "data"
@@ -30,20 +30,6 @@ RESULTS_DIR = Path(__file__).parent.parent / "results"
 FEES = 0.001
 INIT_CASH = 1_000_000
 POSITION_SIZE_PCT = 0.30
-
-
-def _strategy_params_from_cfg(cfg: dict) -> dict:
-    s = cfg["strategy"]
-    if s == "ema_crossover":
-        return {"fast_window": cfg["fast_window"], "slow_window": cfg["slow_window"]}
-    elif s == "rsi":
-        return {"window": cfg["window"], "lower": cfg["lower"], "upper": cfg["upper"]}
-    elif s == "atr_trend":
-        return {"ma_len": cfg["ma_len"], "atr_len": cfg["atr_len"], "atr_mult": cfg["atr_mult"]}
-    elif s == "rsi_ema_filter":
-        return {"ema_len": cfg["ema_len"], "rsi_period": cfg["rsi_period"],
-                "oversold": cfg["oversold"], "overbought": cfg["overbought"]}
-    raise ValueError(f"Unknown strategy: {s}")
 
 
 def run_period(cfg: dict, data: vbt.Data, start=None, end=None, label="") -> dict:
@@ -57,7 +43,7 @@ def run_period(cfg: dict, data: vbt.Data, start=None, end=None, label="") -> dic
         high = high.loc[start:end]
         low = low.loc[start:end]
 
-    params = _strategy_params_from_cfg(cfg)
+    params = _strategy_params(cfg)
     entries, exits = compute_signals(cfg["strategy"], close, high, low, **params)
 
     pf_kwargs = dict(
@@ -70,7 +56,7 @@ def run_period(cfg: dict, data: vbt.Data, start=None, end=None, label="") -> dic
         size_type="percent",
         group_by=True,
         cash_sharing=True,
-        call_seq="auto",
+        call_seq="default",
     )
     if cfg.get("sl_stop"):
         pf_kwargs["sl_stop"] = cfg["sl_stop"]

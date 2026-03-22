@@ -1,0 +1,20 @@
+{
+  "strategy": "vec_rsi_regime",
+  "timeframe": "4h",
+  "length": 15,
+  "mult": 1.0,
+  "rsi_window": 14,
+  "rsi_lower": 35,
+  "rsi_upper": 65,
+  "atr_ratio_threshold": 0.8,
+  "sl_stop": 0.03,
+  "tp_stop": null,
+  "sortino": 1.4899219226153217,
+  "sharpe": 1.2848040607356614,
+  "calmar": 1.8304986373735816,
+  "composite": 1.5305595784789017,
+  "max_drawdown": 0.1526728978934867,
+  "total_return": 0.28033170572272986,
+  "trades_per_day": 0.9068493150684932,
+  "n_trades": 331
+}
