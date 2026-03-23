@@ -1,0 +1,121 @@
+// @version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// vec_rsi_regime — Roostoo Hackathon Validation
+//
+// Mirrors bot/indicators.py vec_rsi_regime_signals() exactly.
+//
+// Logic:
+//   Regime gate: ATR(5)/ATR(50) — computed with Wilder's RMA, same as Python
+//     high_vol  = ratio > threshold  → use VEC breakout entries
+//     low_vol   = ratio <= threshold → use RSI mean-reversion entries
+//   VEC entry  : high > prev_close + SMA(TR, length) * mult
+//   VEC exit   : low  < prev_close - SMA(TR, length) * mult
+//   RSI entry  : RSI(14) crosses BELOW 35   (oversold)
+//   RSI exit   : RSI(14) crosses ABOVE 65   (overbought)
+//   Meta entry : (VEC entry AND high_vol) OR (RSI entry AND low_vol)
+//   Meta exit  : VEC exit OR RSI exit  (union — either closes position)
+//   Stop loss  : fixed 3% below fill price
+//
+// TradingView settings:
+//   Chart       : BTCUSDT / ETHUSDT / SOLUSDT — run on each separately
+//   Timeframe   : 4H  ← must match
+//   Capital     : 1,000,000 USD  (or scale — only ratios matter)
+//   Position    : 20% of equity per trade
+//   Commission  : 0.1% (taker)
+//   Slippage    : 0
+// ─────────────────────────────────────────────────────────────────────────────
+
+strategy(
+    title              = "vec_rsi_regime 4H [Roostoo]",
+    overlay            = true,
+    initial_capital    = 1000000,
+    default_qty_type   = strategy.percent_of_equity,
+    default_qty_value  = 20,
+    commission_type    = strategy.commission.percent,
+    commission_value   = 0.1,
+    slippage           = 0,
+    calc_on_every_tick = false
+)
+
+// ─── Inputs ───────────────────────────────────────────────────────────────────
+// Group: VEC
+vec_len  = input.int(  15,  "VEC Length (SMA of TR)",    minval=1, group="VEC — Volatility Expansion Close")
+vec_mult = input.float(1.0, "VEC Multiplier",            minval=0.1, step=0.1, group="VEC — Volatility Expansion Close")
+
+// Group: RSI
+rsi_per  = input.int(  14,  "RSI Period",                minval=2, group="RSI — Mean Reversion")
+rsi_lo   = input.int(  35,  "RSI Oversold threshold",    minval=10, maxval=50, group="RSI — Mean Reversion")
+rsi_hi   = input.int(  65,  "RSI Overbought threshold",  minval=50, maxval=90, group="RSI — Mean Reversion")
+
+// Group: Regime gate
+atr_s    = input.int(   5,  "ATR Short period",          minval=1, group="Regime Gate (ATR ratio)")
+atr_l    = input.int(  50,  "ATR Long period",           minval=5, group="Regime Gate (ATR ratio)")
+atr_thr  = input.float(0.8, "Ratio threshold (high_vol > this → VEC)", minval=0.1, step=0.1, group="Regime Gate (ATR ratio)")
+
+// Group: Risk
+sl_pct   = input.float(3.0, "Stop Loss %",               minval=0.1, step=0.1, group="Risk") / 100.0
+
+// ─── VEC Calculation ──────────────────────────────────────────────────────────
+// Python: band = sma(true_range(h,l,c), length) * mult
+// Pine  : ta.tr(true) ≡ max(h-l, abs(h-close[1]), abs(l-close[1]))
+//         ta.sma(tr, length) ≡ rolling mean — matches Python sma()
+tr_val   = ta.tr(true)
+vec_band = ta.sma(tr_val, vec_len) * vec_mult
+
+// Entry: high > close[1] + band[1]
+// Exit : low  < close[1] - band[1]
+vec_upper  = close[1] + vec_band[1]
+vec_lower  = close[1] - vec_band[1]
+vec_entry  = high > vec_upper
+vec_exit   = low  < vec_lower
+
+// ─── RSI Calculation ──────────────────────────────────────────────────────────
+// Python: uses rma() = ewm(alpha=1/period) ≡ ta.rma() in Pine
+// ta.rsi() internally uses ta.rma() — matches Python exactly
+rsi_val    = ta.rsi(close, rsi_per)
+rsi_entry  = ta.crossunder(rsi_val, rsi_lo)   // RSI crosses below oversold
+rsi_exit   = ta.crossover (rsi_val, rsi_hi)   // RSI crosses above overbought
+
+// ─── Regime Gate ──────────────────────────────────────────────────────────────
+// Python: atr_expansion_ratio uses rma() = ta.rma() in Pine — matches
+atr_short  = ta.rma(tr_val, atr_s)
+atr_long   = ta.rma(tr_val, atr_l)
+atr_ratio  = atr_short / atr_long
+high_vol   = atr_ratio >  atr_thr   // vol expanding → VEC regime
+low_vol    = atr_ratio <= atr_thr   // vol contracting → RSI regime
+
+// ─── Meta-signal ──────────────────────────────────────────────────────────────
+entry_sig  = (vec_entry and high_vol) or (rsi_entry and low_vol)
+exit_sig   = vec_exit or rsi_exit
+
+// ─── Strategy Execution ───────────────────────────────────────────────────────
+// Only long positions (strategy is long-only)
+if entry_sig and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, comment=high_vol ? "VEC" : "RSI")
+
+// Stop loss — fixed % below average entry price
+if strategy.position_size > 0
+    strategy.exit("SL", from_entry="Long",
+                  stop=strategy.position_avg_price * (1.0 - sl_pct),
+                  comment="3% SL")
+
+// Signal exit
+if exit_sig and strategy.position_size > 0
+    strategy.close("Long", comment=vec_exit ? "VEC_X" : "RSI_X")
+
+// ─── Visuals ─────────────────────────────────────────────────────────────────
+// VEC bands on main chart
+plot(vec_upper, "VEC Upper", color=color.new(color.green, 60), linewidth=1)
+plot(vec_lower, "VEC Lower", color=color.new(color.red,   60), linewidth=1)
+
+// Regime background: green = high_vol (VEC active), blue = low_vol (RSI active)
+bgcolor(high_vol ? color.new(color.green, 92) : color.new(color.blue, 92),
+        title="Regime (green=VEC, blue=RSI)")
+
+// Entry/exit markers
+plotshape(entry_sig and strategy.position_size[1] == 0,
+          title="Entry", style=shape.triangleup,
+          location=location.belowbar, color=color.lime, size=size.small)
+plotshape(exit_sig and strategy.position_size > 0,
+          title="Exit", style=shape.triangledown,
+          location=location.abovebar, color=color.red, size=size.small)
