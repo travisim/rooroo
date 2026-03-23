@@ -22,8 +22,10 @@ Results saved to results/sweep_results.csv and results/best_params.json.
 
 import argparse
 import json
+import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import product
 from pathlib import Path
 
@@ -47,6 +49,44 @@ FEES = 0.001            # 0.1% taker
 INIT_CASH = 1_000_000
 POSITION_SIZE_PCT = 0.30
 
+CSV_COLS = [
+    "strategy", "timeframe", "composite", "sortino", "sharpe", "calmar",
+    "trades_per_day", "max_drawdown", "total_return", "n_trades",
+    # Param columns (optional — present only when relevant strategy is run)
+    "length", "mult", "rsi_window", "rsi_lower", "rsi_upper",
+    "atr_ratio_threshold", "garch_window", "vol_percentile",
+    "k", "horizon", "max_bars_back", "kernel_lookback", "kernel_alpha",
+    "ema_len", "fast_window", "slow_window", "sl_stop", "tp_stop",
+    # XGBoost / vec_rsi_xgb_regime params
+    "n_estimators", "max_depth", "xgb_threshold", "use_garch",
+    "train_window_bars", "predict_window_bars",
+]
+
+# ── Parallel worker state (module-level so spawn can pickle) ─────────────────
+_WORKER_DATA: dict = {}   # tf → vbt.Data, populated by _init_worker
+
+
+def _init_worker(data_dir_str: str, timeframes: list) -> None:
+    """Initialise one worker process: load HDF5 data for all timeframes once."""
+    global _WORKER_DATA
+    data_dir = Path(data_dir_str)
+    for tf in timeframes:
+        p = data_dir / f"binance_{tf}.h5"
+        if p.exists():
+            _WORKER_DATA[tf] = vbt.HDFData.pull(str(p))
+
+
+def _run_cfg_worker(cfg: dict) -> dict:
+    """Run one config in a worker process. Returns metrics dict."""
+    tf = cfg.get("timeframe", "")
+    data = _WORKER_DATA.get(tf)
+    if data is None:
+        return {**cfg, "composite": float("nan"), "n_trades": 0}
+    try:
+        return run_single(cfg, data)
+    except Exception as e:
+        return {**cfg, "composite": float("nan"), "n_trades": 0, "_err": str(e)}
+
 # Bars per month per timeframe — used to compute XGBoost rolling windows
 TF_BARS_PER_MONTH = {
     "1m": 43_200, "5m": 8_640, "15m": 2_880, "30m": 1_440,
@@ -55,6 +95,53 @@ TF_BARS_PER_MONTH = {
 
 
 # ── Parameter grid ────────────────────────────────────────────────────────────
+
+def build_sweep_configs_r2(timeframes: list[str]) -> list[dict]:
+    """Round 2 narrow grid — KNN only, targeting t/d ≥ 0.9 while C > 1.5.
+
+    Key lever: sample_step (1,2,4) — smaller = more candidates = more signals.
+    Grid centred on best R1 params: k=8, h=8, mbk=1000, kl=8, ka=1.0, sl=0.03.
+    Runs in ~6-8 min sequential; peak RAM ~600 MB.
+    """
+    configs = []
+    for tf in timeframes:
+        if tf == "4h":
+            for k_val, horizon, mbk, kl, ka, sl, ss in product(
+                [2, 4, 8, 16],       # k=2,4 for higher t/d; k=8 for R1 best quality
+                [4, 8],              # horizons (skip h=2; noisy in R1)
+                [500, 1000],         # max bars back
+                [4, 8, 16],          # kernel lookback
+                [0.5, 1.0, 2.0],     # kernel alpha
+                [0.03, 0.05],        # stop loss
+                [2, 4],              # sample_step=2 doubles candidates vs R1's 4
+            ):
+                configs.append({
+                    "strategy": "lorentzian_knn", "timeframe": tf,
+                    "k": k_val, "features": "rsi_wt_cci_rsi9_adx",
+                    "max_bars_back": mbk, "use_kernel": True,
+                    "kernel_lookback": kl, "kernel_alpha": ka,
+                    "horizon": horizon, "sample_step": ss,
+                    "sl_stop": sl, "tp_stop": None,
+                })
+        elif tf == "1h":
+            for k_val, horizon, kl, ka, sl, ss in product(
+                [4, 8],              # k neighbours
+                [4, 8],              # horizon
+                [8, 16],             # kernel lookback
+                [1.0, 2.0],          # kernel alpha
+                [0.03, 0.05],        # stop loss
+                [2, 4],              # sample_step
+            ):
+                configs.append({
+                    "strategy": "lorentzian_knn", "timeframe": tf,
+                    "k": k_val, "features": "rsi_wt_cci_rsi9_adx",
+                    "max_bars_back": 1000, "use_kernel": True,
+                    "kernel_lookback": kl, "kernel_alpha": ka,
+                    "horizon": horizon, "sample_step": ss,
+                    "sl_stop": sl, "tp_stop": None,
+                })
+    return configs
+
 
 def build_sweep_configs(timeframes: list[str]) -> list[dict]:
     configs = []
@@ -198,31 +285,40 @@ def build_sweep_configs(timeframes: list[str]) -> list[dict]:
                     "atr_ratio_threshold": threshold, "garch_window": gw,
                 })
 
-        # ── 10. Lorentzian KNN (1h/4h only — bar-by-bar loop) ─────────────
+        # ── 10. Lorentzian KNN — fixed labels + RQK kernel (1h/4h) ───────
         if tf in ("1h", "4h"):
-            for k_val, features, mbk, use_kernel in product(
-                [6, 8, 10],
-                ["rsi_wt_cci", "rsi_wt_cci_adx"],
-                [500, 1000, 2000],
-                [False, True],
+            for k_val, horizon, mbk, kl, ka, sl in product(
+                [4, 8, 16, 32],          # k neighbours
+                [2, 4, 8],               # forward label horizon
+                [1000, 2000],            # max bars back
+                [8, 16],                 # kernel lookback
+                [0.5, 1.0, 2.0],         # kernel alpha (RQK smoothness)
+                [0.03, 0.05],            # stop loss
             ):
                 configs.append({
                     "strategy": "lorentzian_knn", "timeframe": tf,
-                    "k": k_val, "features": features,
-                    "max_bars_back": mbk, "use_kernel": use_kernel,
-                    "sl_stop": 0.05, "tp_stop": None,
+                    "k": k_val, "features": "rsi_wt_cci_rsi9_adx",
+                    "max_bars_back": mbk, "use_kernel": True,
+                    "kernel_lookback": kl, "kernel_alpha": ka,
+                    "horizon": horizon, "sample_step": 4,
+                    "sl_stop": sl, "tp_stop": None,
                 })
-            # Lorentzian KNN + GARCH
-            for k_val, features, mbk in product(
-                [8], ["rsi_wt_cci", "rsi_wt_cci_adx"], [500, 1000],
+
+        # ── 10b. vec_garch_regime — VEC gated by GARCH high-vol ──────────
+        if tf in ("1h", "4h"):
+            for length, mult, gw, vp, sl in product(
+                [5, 7, 10, 15],          # VEC length
+                [0.75, 1.0, 1.5],        # VEC mult
+                [126, 252],              # GARCH window
+                [50.0, 60.0, 70.0],      # vol percentile threshold
+                [0.03, 0.05],            # stop loss
             ):
-                for gw in [126, 252]:
-                    configs.append({
-                        "strategy": "lorentzian_knn+garch", "timeframe": tf,
-                        "k": k_val, "features": features,
-                        "max_bars_back": mbk, "use_kernel": False,
-                        "sl_stop": 0.05, "tp_stop": None, "garch_window": gw,
-                    })
+                configs.append({
+                    "strategy": "vec_garch_regime", "timeframe": tf,
+                    "length": length, "mult": mult,
+                    "garch_window": gw, "vol_percentile": vp,
+                    "sl_stop": sl, "tp_stop": None,
+                })
 
         # ── 11b. VEC+RSI Regime meta-strategy (Round 2 narrow grid) ──────────
         # Focused on 1h and 4h where VEC shines; target: composite>1.5 + t/d≥0.9
@@ -243,7 +339,7 @@ def build_sweep_configs(timeframes: list[str]) -> list[dict]:
                     "sl_stop": sl, "tp_stop": None,
                 })
 
-        # ── 11. XGBoost (1h/4h only — rolling train/predict) ──────────────
+        # ── 11. XGBoost vanilla (1h/4h only — rolling train/predict) ────────
         if tf in ("1h", "4h"):
             bars_month = TF_BARS_PER_MONTH[tf]
             for n_est, max_d, mcw, thr, sl in product(
@@ -255,6 +351,44 @@ def build_sweep_configs(timeframes: list[str]) -> list[dict]:
                     "predict_window_bars": bars_month,
                     "n_estimators": n_est, "max_depth": max_d,
                     "min_child_weight": mcw, "threshold": thr,
+                    "sl_stop": sl, "tp_stop": None,
+                })
+
+        # ── 12. XGBoost + GARCH features (4h only) ────────────────────────
+        if tf == "4h":
+            bars_month = TF_BARS_PER_MONTH[tf]
+            for n_est, max_d, thr, sl in product(
+                [100, 200], [3, 5], [0.45, 0.50, 0.55], [0.03, 0.05],
+            ):
+                configs.append({
+                    "strategy": "xgboost", "timeframe": tf,
+                    "train_window_bars": bars_month * 6,
+                    "predict_window_bars": bars_month,
+                    "n_estimators": n_est, "max_depth": max_d,
+                    "min_child_weight": 1, "threshold": thr,
+                    "use_garch": True,
+                    "sl_stop": sl, "tp_stop": None,
+                })
+
+        # ── 13. VEC+RSI+XGBoost regime (4h only) ─────────────────────────
+        # XGBoost as a precision filter on top of the deployed vec_rsi_regime baseline.
+        # Centred on best deployed params: length=15, mult=1.0, rsi_lower=35, thr=0.8.
+        if tf == "4h":
+            for xgb_thr, sl, n_est, max_d in product(
+                [0.40, 0.45, 0.50, 0.55, 0.60],  # filter strictness
+                [0.03, 0.05],                      # stop loss
+                [100, 200],                        # n_estimators
+                [3, 5],                            # max_depth
+            ):
+                configs.append({
+                    "strategy": "vec_rsi_xgb_regime", "timeframe": tf,
+                    "length": 15, "mult": 1.0,
+                    "rsi_window": 14, "rsi_lower": 35, "rsi_upper": 65,
+                    "atr_ratio_threshold": 0.8,
+                    "train_window_bars": 1080,   # 6 months on 4h
+                    "predict_window_bars": 180,  # 1 month on 4h
+                    "n_estimators": n_est, "max_depth": max_d,
+                    "xgb_threshold": xgb_thr,
                     "sl_stop": sl, "tp_stop": None,
                 })
 
@@ -289,9 +423,34 @@ def _strategy_params(cfg: dict) -> dict:
         }
     elif base == "lorentzian_knn":
         params = {
-            "k": cfg["k"], "features": cfg["features"],
-            "max_bars_back": cfg["max_bars_back"],
-            "use_kernel": cfg.get("use_kernel", False),
+            "k": cfg["k"], "features": cfg.get("features", "rsi_wt_cci_rsi9_adx"),
+            "max_bars_back": cfg.get("max_bars_back", 2000),
+            "use_kernel": cfg.get("use_kernel", True),
+            "kernel_lookback": cfg.get("kernel_lookback", 8),
+            "kernel_alpha": cfg.get("kernel_alpha", 1.0),
+            "horizon": cfg.get("horizon", 4),
+            "sample_step": cfg.get("sample_step", 4),
+        }
+    elif base == "vec_garch_regime":
+        params = {
+            "length": cfg.get("length", 5),
+            "mult": cfg.get("mult", 1.0),
+            "garch_window": cfg.get("garch_window", 252),
+            "vol_percentile": cfg.get("vol_percentile", 60.0),
+        }
+    elif base == "vec_rsi_xgb_regime":
+        params = {
+            "length": cfg.get("length", 15),
+            "mult": cfg.get("mult", 1.0),
+            "rsi_window": cfg.get("rsi_window", 14),
+            "rsi_lower": cfg.get("rsi_lower", 35),
+            "rsi_upper": cfg.get("rsi_upper", 65),
+            "atr_ratio_threshold": cfg.get("atr_ratio_threshold", 0.8),
+            "train_window_bars": cfg.get("train_window_bars", 1080),
+            "predict_window_bars": cfg.get("predict_window_bars", 180),
+            "n_estimators": cfg.get("n_estimators", 100),
+            "max_depth": cfg.get("max_depth", 3),
+            "xgb_threshold": cfg.get("xgb_threshold", 0.50),
         }
     elif base == "xgboost":
         params = {
@@ -301,6 +460,7 @@ def _strategy_params(cfg: dict) -> dict:
             "max_depth": cfg["max_depth"],
             "min_child_weight": cfg["min_child_weight"],
             "threshold": cfg["threshold"],
+            "use_garch": cfg.get("use_garch", False),
         }
     else:
         raise ValueError(f"Unknown base strategy: {base}")
@@ -317,7 +477,7 @@ def _strategy_params(cfg: dict) -> dict:
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
 ANN_FACTORS = {
-    "1m": 525_600, "5m": 105_120, "15m": 35_040, "30m": 17_520,
+    "1m": 525_600, "3m": 175_200, "5m": 105_120, "15m": 35_040, "30m": 17_520,
     "1h": 8_760, "4h": 2_190, "1d": 365,
 }
 
@@ -419,14 +579,16 @@ def run_sweep(
     strategies: list[str] | None = None,
     stop_on_target: bool = True,
     csv_path: Path | None = None,
+    _override_configs: list[dict] | None = None,
 ):
-    all_configs = build_sweep_configs(timeframes)
-
-    # Filter by strategy if --strategies flag provided
-    if strategies:
-        configs = [c for c in all_configs if c["strategy"] in strategies]
+    if _override_configs is not None:
+        configs = _override_configs
     else:
-        configs = all_configs
+        all_configs = build_sweep_configs(timeframes)
+        if strategies:
+            configs = [c for c in all_configs if c["strategy"] in strategies]
+        else:
+            configs = all_configs
 
     if not configs:
         print("No configs matched the given --strategies filter.")
@@ -435,7 +597,7 @@ def run_sweep(
     if csv_path is None:
         csv_path = RESULTS_DIR / "sweep_results.csv"
 
-    strat_filter_str = f" (strategies: {', '.join(strategies)})" if strategies else ""
+    strat_filter_str = f" (strategies: {', '.join(strategies)})" if strategies and not _override_configs else ""
     print(f"\n{'='*65}")
     print(f"RALPH LOOP — {len(configs)} configs{strat_filter_str}")
     print(f"Target : composite > {COMPOSITE_TARGET}, trades/day >= {MIN_TRADES_PER_DAY}, dd < {MAX_DRAWDOWN_PCT*100:.0f}%")
@@ -443,11 +605,6 @@ def run_sweep(
 
     best = {"composite": -np.inf, "config": None}
     loaded: dict[str, vbt.Data] = {}
-
-    CSV_COLS = [
-        "strategy", "timeframe", "composite", "sortino", "sharpe", "calmar",
-        "trades_per_day", "max_drawdown", "total_return", "n_trades",
-    ]
 
     # Write or append CSV header
     write_header = not csv_path.exists()
@@ -490,7 +647,7 @@ def run_sweep(
         if meets and c > best["composite"]:
             best = {"composite": c, "config": metrics}
 
-        pd.DataFrame([{k: metrics[k] for k in CSV_COLS}]).to_csv(csv_path, mode="a", header=False, index=False)
+        pd.DataFrame([{k: metrics.get(k) for k in CSV_COLS}]).to_csv(csv_path, mode="a", header=False, index=False)
 
         if stop_on_target and meets and c > COMPOSITE_TARGET:
             print(f"\n{'='*65}")
@@ -519,6 +676,102 @@ def run_sweep(
     return best
 
 
+def run_sweep_parallel(
+    timeframes: list,
+    strategies: list | None = None,
+    n_workers: int = 6,
+    stop_on_target: bool = True,
+    csv_path: Path | None = None,
+):
+    """Parallel sweep using ProcessPoolExecutor — one process per P-core."""
+    all_configs = build_sweep_configs(timeframes)
+    configs = [c for c in all_configs if c["strategy"] in strategies] if strategies else all_configs
+    if not configs:
+        print("No configs matched the given --strategies filter.")
+        return {}
+
+    if csv_path is None:
+        csv_path = RESULTS_DIR / "sweep_results.csv"
+
+    strat_str = f" (strategies: {', '.join(strategies)})" if strategies else ""
+    print(f"\n{'='*65}")
+    print(f"RALPH LOOP PARALLEL — {len(configs)} configs / {n_workers} workers{strat_str}")
+    print(f"Target : composite > {COMPOSITE_TARGET}, trades/day >= {MIN_TRADES_PER_DAY}, dd < {MAX_DRAWDOWN_PCT*100:.0f}%")
+    print(f"{'='*65}\n")
+
+    # Fresh CSV
+    pd.DataFrame(columns=CSV_COLS).to_csv(csv_path, index=False)
+
+    best = {"composite": -np.inf, "config": None}
+    done = 0
+    t_start = time.time()
+
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_init_worker,
+        initargs=(str(DATA_DIR), timeframes),
+    ) as executor:
+        futures = {executor.submit(_run_cfg_worker, cfg): cfg for cfg in configs}
+
+        for future in as_completed(futures):
+            done += 1
+            try:
+                result = future.result(timeout=600)
+            except Exception as e:
+                cfg = futures[future]
+                result = {**cfg, "composite": float("nan"), "n_trades": 0}
+                print(f"[{done:>5}/{len(configs)}] ERROR {cfg.get('strategy','?')}/{cfg.get('timeframe','?')}: {e}")
+                continue
+
+            c = result.get("composite", float("nan"))
+            t_d = result.get("trades_per_day", 0)
+            dd = result.get("max_drawdown", 1.0)
+            meets = t_d >= MIN_TRADES_PER_DAY and dd < MAX_DRAWDOWN_PCT
+            flag = " *** NEW BEST ***" if meets and not np.isnan(c) and c > best["composite"] else ""
+
+            elapsed = time.time() - t_start
+            rate_per_sec = done / elapsed if elapsed > 0 else 0
+            rate = rate_per_sec * 60  # configs/min for display
+            eta_min = (len(configs) - done) / rate_per_sec / 60 if rate_per_sec > 0 else 0
+
+            print(
+                f"[{done:>5}/{len(configs)}] {result.get('strategy','?'):<32} "
+                f"{result.get('timeframe','?'):<4} C={c:>6.3f} "
+                f"t/d={t_d:.2f} dd={dd*100:.1f}% "
+                f"[{rate:.1f}/min ETA {eta_min:.0f}m]{flag}"
+            )
+
+            if meets and not np.isnan(c) and c > best["composite"]:
+                best = {"composite": c, "config": result}
+
+            pd.DataFrame([{k: result.get(k, float("nan")) for k in CSV_COLS}]).to_csv(
+                csv_path, mode="a", header=False, index=False
+            )
+
+            if stop_on_target and meets and c > COMPOSITE_TARGET:
+                print(f"\nRALPH LOOP TARGET REACHED: composite={c:.4f}")
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+
+    # Sort final CSV
+    if csv_path.exists():
+        df = pd.read_csv(csv_path).sort_values("composite", ascending=False)
+        df.to_csv(csv_path, index=False)
+        print(f"\n{'='*65}\nTOP 10 CONFIGURATIONS\n{'='*65}")
+        print(df.head(10)[["strategy","timeframe","composite","sortino","sharpe",
+                            "calmar","trades_per_day","max_drawdown","total_return"]].to_string(index=False))
+
+    if best["config"]:
+        best_path = RESULTS_DIR / "best_params.json"
+        best_path.write_text(json.dumps(best["config"], indent=2, default=str))
+        print(f"\nBest params → {best_path}")
+        print(json.dumps(best["config"], indent=2, default=str))
+    else:
+        print("\nNo configuration met all criteria.")
+
+    return best
+
+
 def main():
     parser = argparse.ArgumentParser(description="Ralph Loop — parameter sweep for the Roostoo bot.")
     parser.add_argument("--timeframes", nargs="+", default=["1h", "4h"],
@@ -529,10 +782,49 @@ def main():
                         help="Only sweep these strategies (e.g. --strategies rsi volty_expan_close)")
     parser.add_argument("--no-stop", action="store_true",
                         help="Run full sweep without early stopping")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Parallel workers (0=sequential, >0=parallel; default 0). "
+                             "Recommended: 6-8 on 8P+4E core machine.")
+    parser.add_argument("--round", type=int, default=1, choices=[1, 2, 3],
+                        help="Sweep round: 1=full grid (default), 2=narrow KNN grid, "
+                             "3=XGBoost+GARCH features + vec_rsi_xgb_regime (4h only)")
     args = parser.parse_args()
 
     tfs = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"] if args.all_timeframes else args.timeframes
-    run_sweep(tfs, strategies=args.strategies, stop_on_target=not args.no_stop)
+
+    if args.round == 2:
+        r2_configs = build_sweep_configs_r2(tfs)
+        print(f"\n{'='*65}")
+        print(f"RALPH LOOP ROUND 2 — {len(r2_configs)} KNN configs (targeting t/d≥0.9)")
+        print(f"Target : composite > {COMPOSITE_TARGET}, trades/day >= {MIN_TRADES_PER_DAY}, dd < {MAX_DRAWDOWN_PCT*100:.0f}%")
+        print(f"{'='*65}\n")
+        r2_csv = RESULTS_DIR / "sweep_results_r2.csv"
+        run_sweep(tfs, strategies=None, stop_on_target=not args.no_stop,
+                  csv_path=r2_csv, _override_configs=r2_configs)
+    elif args.round == 3:
+        all_configs = build_sweep_configs(["4h"])
+        r3_configs = [
+            c for c in all_configs
+            if c["strategy"] == "vec_rsi_xgb_regime"
+            or (c["strategy"] == "xgboost" and c.get("use_garch"))
+        ]
+        print(f"\n{'='*65}")
+        print(f"RALPH LOOP ROUND 3 — {len(r3_configs)} configs (XGBoost+GARCH features + vec_rsi_xgb_regime)")
+        print(f"Sequential / RAM-safe. Est. ~{len(r3_configs) * 30 // 60} min.")
+        print(f"Target : composite > {COMPOSITE_TARGET}, trades/day >= {MIN_TRADES_PER_DAY}, dd < {MAX_DRAWDOWN_PCT*100:.0f}%")
+        print(f"{'='*65}\n")
+        r3_csv = RESULTS_DIR / "sweep_results_r3.csv"
+        run_sweep(["4h"], strategies=None, stop_on_target=not args.no_stop,
+                  csv_path=r3_csv, _override_configs=r3_configs)
+    elif args.workers > 0:
+        run_sweep_parallel(
+            tfs,
+            strategies=args.strategies,
+            n_workers=args.workers,
+            stop_on_target=not args.no_stop,
+        )
+    else:
+        run_sweep(tfs, strategies=args.strategies, stop_on_target=not args.no_stop)
 
 
 if __name__ == "__main__":

@@ -9,34 +9,30 @@ import pandas as pd
 
 # ── GARCH Volatility Filter ────────────────────────────────────────────────────
 
-def garch_vol_mask(
+def garch_vol_series(
     close: pd.Series,
     window: int = 252,
-    vol_percentile: float = 75.0,
-    refit_every: int = 24,
+    refit_every: int = 96,
 ) -> pd.Series:
     """
-    Returns a boolean Series: True where predicted conditional vol is BELOW
-    the rolling vol_percentile threshold (i.e., entry is permitted).
+    Returns GARCH(1,1) predicted conditional volatility as a float Series.
+    Aligned to close.index; NaN for warmup bars.
 
-    Fits GARCH(1,1) on a rolling window of log-returns using only past data.
-    Refits every `refit_every` bars (not every bar) for speed.
+    Use as a raw feature for ML models. garch_vol_mask wraps this
+    with a rolling-percentile threshold to produce a boolean entry gate.
 
-    Lookahead rule: fit window is strictly [t-window, t-1]. Forecast is for
-    bar t+1 and is used as the gate for bar t+1's entry signal.
+    Lookahead rule: fit window is strictly [t-window, t-1].
     """
     from arch import arch_model
 
-    log_rets = (np.log(close / close.shift(1)).dropna() * 100)  # scale for GARCH
+    log_rets = (np.log(close / close.shift(1)).dropna() * 100)
     n = len(log_rets)
-    mask = pd.Series(False, index=close.index)
 
     predicted_vols = []
-    last_params = None   # fitted [omega, alpha, beta, ...]
-    last_var = None      # last conditional variance (for recursion)
+    last_params = None
+    last_var = None
 
     for i in range(window, n):
-        # Refit periodically
         if i % refit_every == 0 or last_params is None:
             train = log_rets.iloc[i - window:i]
             try:
@@ -52,7 +48,6 @@ def garch_vol_mask(
         else:
             # Fast GARCH(1,1) one-step variance update:
             #   σ²_t = omega + alpha * ε²_{t-1} + beta * σ²_{t-1}
-            # No optimizer call — purely arithmetic.
             try:
                 p = last_params
                 omega = float(p.get("omega", p.iloc[0]))
@@ -67,10 +62,33 @@ def garch_vol_mask(
 
         predicted_vols.append(np.sqrt(max(pred_var, 0)))
 
-    vol_series = pd.Series(predicted_vols, index=log_rets.index[window:])
+    result = pd.Series(np.nan, index=close.index)
+    if predicted_vols:
+        result.loc[log_rets.index[window:]] = predicted_vols
+    return result
+
+
+def garch_vol_mask(
+    close: pd.Series,
+    window: int = 252,
+    vol_percentile: float = 75.0,
+    refit_every: int = 96,   # 24→96: 4× faster; GARCH params stable over weeks
+) -> pd.Series:
+    """
+    Returns a boolean Series: True where predicted conditional vol is BELOW
+    the rolling vol_percentile threshold (i.e., entry is permitted).
+
+    Fits GARCH(1,1) on a rolling window of log-returns using only past data.
+    Refits every `refit_every` bars (not every bar) for speed.
+
+    Lookahead rule: fit window is strictly [t-window, t-1]. Forecast is for
+    bar t+1 and is used as the gate for bar t+1's entry signal.
+    """
+    vol_s = garch_vol_series(close, window=window, refit_every=refit_every)
+    vol_series = vol_s.dropna()
     rolling_pct = vol_series.rolling(window, min_periods=window // 2).quantile(vol_percentile / 100)
     allowed = vol_series < rolling_pct
-
+    mask = pd.Series(False, index=close.index)
     mask.loc[allowed.index] = allowed.values
     return mask
 
@@ -104,6 +122,7 @@ def xgboost_rolling_signals(
     threshold: float = 0.5,
     horizon: int = 4,
     label_threshold: float = 0.002,
+    use_garch: bool = False,
     **kwargs,
 ) -> tuple[pd.Series, pd.Series]:
     """
@@ -120,11 +139,13 @@ def xgboost_rolling_signals(
 
     Entry: predicted probability > threshold.
     Exit:  predicted probability <= threshold.
+
+    use_garch: if True, adds GARCH conditional volatility features (~6s extra per symbol).
     """
     from xgboost import XGBClassifier
     from bot.indicators import build_xgb_features
 
-    features = build_xgb_features(close, high, low)
+    features = build_xgb_features(close, high, low, use_garch=use_garch)
     labels_full = build_xgb_labels(close, horizon=horizon, threshold=label_threshold)
 
     n = len(close)

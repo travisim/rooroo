@@ -120,22 +120,76 @@ def crossed_below(a, b):
 
 def build_xgb_features(
     close: pd.Series, high: pd.Series, low: pd.Series,
+    use_garch: bool = False,
 ) -> pd.DataFrame:
     """
     Feature matrix for XGBoost. All features use only close[t] or earlier — no lookahead.
+
+    Base features (always computed, ~0.1s):
+        RSI(14), RSI(7), EMA diff(9/21), ATR ratio(5/50), CCI(20), ADX(14),
+        Bollinger %B(20), Bollinger width(20), MACD histogram(12/26/9),
+        dist_ema50, dist_ema200, realized vol ratio(5/50),
+        returns at 1/3/5/10/20 bars, day_of_week, hour.
+
+    Optional GARCH features (use_garch=True, adds ~6s per symbol):
+        garch_vol: GARCH(1,1) conditional volatility
+        garch_vol_pct: rolling percentile rank of garch_vol (0-1)
     """
     feats = pd.DataFrame(index=close.index)
+
+    # Momentum / mean-reversion
     feats["rsi_14"] = rsi(close, 14)
     feats["rsi_7"] = rsi(close, 7)
-    feats["ema_diff"] = (ema(close, 9) - ema(close, 21)) / close
+
+    # Trend
+    feats["ema_diff_9_21"] = (ema(close, 9) - ema(close, 21)) / close
+    feats["dist_ema50"] = (close - ema(close, 50)) / close
+    feats["dist_ema200"] = (close - ema(close, 200)) / close
+
+    # Volatility regime
     feats["atr_ratio"] = atr_expansion_ratio(high, low, close, 5, 50)
+    short_vol = close.pct_change().rolling(5).std()
+    long_vol = close.pct_change().rolling(50).std()
+    feats["realized_vol_ratio"] = short_vol / long_vol.replace(0, np.nan)
+
+    # Oscillators
     feats["cci_20"] = cci(close, high, low, 20)
     feats["adx_14"] = adx(high, low, close, 14)
+
+    # Bollinger Bands
+    bb_mid = sma(close, 20)
+    bb_std = close.rolling(20).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    feats["bb_pct_b"] = (close - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
+    feats["bb_width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
+
+    # MACD histogram (normalised by price)
+    macd_line = ema(close, 12) - ema(close, 26)
+    feats["macd_hist"] = (macd_line - ema(macd_line, 9)) / close
+
+    # Returns at multiple horizons
     feats["return_1"] = close.pct_change(1)
+    feats["return_3"] = close.pct_change(3)
     feats["return_5"] = close.pct_change(5)
+    feats["return_10"] = close.pct_change(10)
     feats["return_20"] = close.pct_change(20)
+
+    # Calendar
     feats["day_of_week"] = close.index.dayofweek.astype(float)
     feats["hour"] = close.index.hour.astype(float)
+
+    # Optional GARCH features
+    if use_garch:
+        from bot.ml_models import garch_vol_series
+        gvol = garch_vol_series(close, window=252)
+        feats["garch_vol"] = gvol
+        # Rolling percentile rank: fraction of past 252 bars where vol was lower
+        feats["garch_vol_pct"] = (
+            gvol.rolling(252, min_periods=126)
+            .apply(lambda x: (x[:-1] < x[-1]).mean() if len(x) > 1 else np.nan, raw=True)
+        )
+
     return feats
 
 
@@ -231,29 +285,147 @@ def vec_rsi_regime_signals(
     return entries, exits
 
 
-def lorentzian_knn_signals(
-    close: pd.Series, high: pd.Series, low: pd.Series,
-    k: int = 8, max_bars_back: int = 1000,
-    use_adx: bool = False, use_kernel: bool = False,
-    kernel_lookback: int = 8,
+def vec_garch_regime_signals(
+    close, high, low,
+    length: int = 5, mult: float = 1.0,
+    garch_window: int = 252, vol_percentile: float = 60.0,
 ):
     """
-    Lorentzian KNN Classification.
-
-    Features (normalized to [0,1] over max_bars_back rolling window):
-        RSI(14), WaveTrend(10,21), CCI(20), optionally ADX(14)
-
-    Distance metric: sum of log(1 + |f_current - f_historical[j]|) per feature.
-    Samples every 4 bars back to ensure chronological spacing.
-
-    Label at bar j = sign(close[j] - close[j-4])  — purely historical, no lookahead.
-    Signal = long if sum(k-nearest labels) > 0.
-
-    Optional kernel filter: suppress entries when EMA(close, kernel_lookback) is falling.
-
-    Restricted to 1h+ timeframes in the sweep (bar-by-bar loop is too slow on 1m/5m).
+    VEC gated by GARCH(1,1) volatility regime.
+    Only takes VEC entries when predicted conditional vol is ABOVE the rolling
+    percentile threshold (i.e., we're in a high-vol / volatile regime).
+    Exits use VEC exit signal.
     """
-    # Multi-symbol DataFrame: dispatch per column
+    from bot.ml_models import garch_vol_mask
+    vec_e, vec_x = volty_expan_close_signals(close, high, low, length, mult)
+    # GARCH mask: True where vol is HIGH (above percentile) — invert the low-vol mask
+    # Must iterate per column when close is a DataFrame (garch_vol_mask expects Series)
+    if isinstance(close, pd.DataFrame):
+        low_vol_mask = pd.DataFrame(
+            {col: garch_vol_mask(close[col], window=garch_window, vol_percentile=vol_percentile)
+             for col in close.columns},
+            index=close.index,
+        ).reindex(vec_e.index, fill_value=False)
+    else:
+        low_vol_mask = garch_vol_mask(close, window=garch_window, vol_percentile=vol_percentile)
+    high_vol_mask = ~low_vol_mask
+    entries = vec_e & high_vol_mask
+    return entries, vec_x
+
+
+def vec_rsi_xgb_regime_signals(
+    close, high, low,
+    length: int = 15, mult: float = 1.0,
+    rsi_window: int = 14, rsi_lower: float = 35, rsi_upper: float = 65,
+    atr_ratio_threshold: float = 0.8,
+    train_window_bars: int = 1080,   # 6 months on 4h
+    predict_window_bars: int = 180,  # 1 month on 4h
+    n_estimators: int = 100,
+    max_depth: int = 3,
+    xgb_threshold: float = 0.50,
+):
+    """
+    vec_rsi_regime entries filtered by a rolling XGBoost quality gate.
+
+    An entry fires only when BOTH conditions hold:
+      1. vec_rsi_regime regime signal is active (VEC in high-vol OR RSI in low-vol)
+      2. XGBoost predicted probability of an up-move exceeds xgb_threshold
+
+    Exits use vec_rsi_regime's exit signals only — XGBoost does not affect exits.
+    This preserves the base strategy's risk control while adding a precision filter.
+    """
+    if isinstance(close, pd.DataFrame):
+        entries_d, exits_d = {}, {}
+        for col in close.columns:
+            e, x = vec_rsi_xgb_regime_signals(
+                close[col], high[col], low[col],
+                length=length, mult=mult,
+                rsi_window=rsi_window, rsi_lower=rsi_lower, rsi_upper=rsi_upper,
+                atr_ratio_threshold=atr_ratio_threshold,
+                train_window_bars=train_window_bars,
+                predict_window_bars=predict_window_bars,
+                n_estimators=n_estimators, max_depth=max_depth,
+                xgb_threshold=xgb_threshold,
+            )
+            entries_d[col] = e
+            exits_d[col] = x
+        return pd.DataFrame(entries_d), pd.DataFrame(exits_d)
+
+    from bot.ml_models import xgboost_rolling_signals
+
+    base_entries, base_exits = vec_rsi_regime_signals(
+        close, high, low,
+        length=length, mult=mult,
+        rsi_window=rsi_window, rsi_lower=rsi_lower, rsi_upper=rsi_upper,
+        atr_ratio_threshold=atr_ratio_threshold,
+    )
+    xgb_entries, _ = xgboost_rolling_signals(
+        close, high, low,
+        train_window_bars=train_window_bars,
+        predict_window_bars=predict_window_bars,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        threshold=xgb_threshold,
+    )
+    entries = base_entries & xgb_entries
+    return entries, base_exits
+
+
+def rational_quadratic_kernel(src: np.ndarray, lookback: int, alpha: float = 1.0) -> np.ndarray:
+    """
+    Nadaraya-Watson Rational Quadratic Kernel smoother — vectorised (no Python loops).
+    Matches the Pine Script implementation used in jdehorty's Lorentzian Classification.
+
+    Weight for lag j: (1 + j² / (2α·lookback²))^(−α)
+    Uses stride_tricks to build a sliding window matrix [n, lookback], then a
+    single matrix-vector dot product replaces the O(n·lookback) Python loop.
+    Memory: n × lookback × 4 bytes ≈ 35k × 16 × 4 = ~2 MB — safe on 16 GB.
+    """
+    n = len(src)
+    # Precompute normalised weights once — shape [lookback]
+    lags = np.arange(1, lookback + 1, dtype=np.float32)
+    weights = (1.0 + lags ** 2 / (2.0 * alpha * lookback ** 2)) ** (-alpha)
+    weights /= weights.sum()
+
+    # Sliding window matrix via stride tricks: shape [n, lookback]
+    # Row i contains [src[i], src[i-1], ..., src[i-lookback+1]]
+    src_f = src.astype(np.float32)
+    padded = np.pad(src_f, (lookback - 1, 0), mode="edge")
+    s = padded.strides[0]
+    window = np.lib.stride_tricks.as_strided(
+        padded[lookback - 1:], shape=(n, lookback), strides=(s, -s)
+    )
+
+    out = window @ weights          # shape [n], fully vectorised
+    out = out.astype(np.float64)
+    out[:lookback] = np.nan         # warmup period
+    return out
+
+
+def lorentzian_knn_signals(
+    close: pd.Series, high: pd.Series, low: pd.Series,
+    k: int = 8, max_bars_back: int = 2000,
+    use_adx: bool = True, use_kernel: bool = True,
+    kernel_lookback: int = 8, kernel_alpha: float = 1.0,
+    horizon: int = 4, sample_step: int = 4,
+):
+    """
+    Lorentzian KNN Classification — fixed to match jdehorty's original Pine Script.
+
+    KEY FIX: Labels are FORWARD-looking for historical bars (no lookahead because
+    those future bars are already in the past when predicting the current bar):
+        label[j] = 1 if close[j + horizon] > close[j] else -1
+    Valid candidates: j + horizon < i  (strictly no lookahead)
+
+    Distance metric: Lorentzian = sum(log(1 + |f_i - f_j|)) per feature.
+    Samples every `sample_step` bars to avoid autocorrelation.
+
+    Features (rolling min-max normalised over max_bars_back):
+        RSI(14), WaveTrend(10,21), CCI(20), RSI(9), optionally ADX(14)
+
+    Optional Rational Quadratic Kernel: smooths the raw vote series and derives
+    crossover-based entry/exit, matching the original script's kernel regression.
+    """
     if isinstance(close, pd.DataFrame):
         entries_d, exits_d = {}, {}
         for col in close.columns:
@@ -261,7 +433,8 @@ def lorentzian_knn_signals(
                 close[col], high[col], low[col],
                 k=k, max_bars_back=max_bars_back,
                 use_adx=use_adx, use_kernel=use_kernel,
-                kernel_lookback=kernel_lookback,
+                kernel_lookback=kernel_lookback, kernel_alpha=kernel_alpha,
+                horizon=horizon, sample_step=sample_step,
             )
             entries_d[col] = e
             exits_d[col] = x
@@ -270,65 +443,103 @@ def lorentzian_knn_signals(
     n = len(close)
     close_arr = close.values.astype(float)
 
-    # Pre-compute normalized features
+    # Features — 5 features matching jdehorty's default set
     f1 = normalize_series(rsi(close, 14), max_bars_back).values.astype(float)
     f2 = normalize_series(wave_trend(close, high, low), max_bars_back).values.astype(float)
     f3 = normalize_series(cci(close, high, low, 20), max_bars_back).values.astype(float)
-    feat_list = [f1, f2, f3]
+    f4 = normalize_series(rsi(close, 9), max_bars_back).values.astype(float)
+    feat_list = [f1, f2, f3, f4]
     if use_adx:
-        f4 = normalize_series(adx(high, low, close, 14), max_bars_back).values.astype(float)
-        feat_list.append(f4)
-    feat_arr = np.stack(feat_list, axis=1)  # (n, n_features)
+        f5 = normalize_series(adx(high, low, close, 14), max_bars_back).values.astype(float)
+        feat_list.append(f5)
+    feat_arr = np.stack(feat_list, axis=1)
 
-    # Kernel estimate for optional trend filter
-    kernel_arr = ema(close, kernel_lookback).values if use_kernel else None
+    # ── Vectorised KNN vote (chunked to cap RAM at ~120 MB; MLX GPU if available) ──
+    # Replaces the O(n) Python bar loop with batched numpy/MLX ops.
+    # chunk_size=4000 → peak memory per chunk ≈ 4000×500×5×4 bytes ≈ 40 MB.
+    raw_vote = np.full(n, np.nan)
+    warmup = max(max_bars_back, horizon + sample_step)
+    n_cand_max = max_bars_back // sample_step          # e.g. 2000/4 = 500
+    offsets = np.arange(1, n_cand_max + 1, dtype=np.int32) * sample_step
+    feat_f32 = feat_arr.astype(np.float32)
+
+    try:
+        import mlx.core as _mx
+        _USE_MLX = True
+    except Exception:
+        _USE_MLX = False
+
+    CHUNK = 4000
+    for chunk_start in range(warmup, n, CHUNK):
+        chunk_end = min(chunk_start + CHUNK, n)
+        q_bars = np.arange(chunk_start, chunk_end, dtype=np.int32)   # [q]
+        q = len(q_bars)
+
+        # Candidate indices: [q, n_cand_max] — fixed sliding window
+        cand_idx = q_bars[:, None] - offsets[None, :]                  # [q, C]
+        # Lookahead guard: label bar (cand + horizon) must be <= current bar (q)
+        # i.e. offset >= horizon; prevents future-data leakage when sample_step < horizon
+        valid = (cand_idx >= 0) & (cand_idx + horizon <= q_bars[:, None])  # [q, C]
+        cand_safe = np.clip(cand_idx, 0, n - 1)
+
+        # Feature validity for queries
+        has_nan = np.any(np.isnan(feat_f32[q_bars]), axis=1)           # [q]
+
+        # Gather candidate features: [q, C, d]
+        c_feats = feat_f32[cand_safe]                                  # [q, C, d]
+
+        # Lorentzian distances: sum(log1p(|qi - cj|)) — GPU if MLX available
+        if _USE_MLX:
+            q_mlx = _mx.array(feat_f32[q_bars])[:, None, :]           # [q, 1, d]
+            c_mlx = _mx.array(c_feats)                                 # [q, C, d]
+            dists_mlx = _mx.sum(_mx.log1p(_mx.abs(q_mlx - c_mlx)), axis=-1)
+            _mx.eval(dists_mlx)
+            dists = np.array(dists_mlx)                                # [q, C]
+        else:
+            diffs = np.abs(feat_f32[q_bars][:, None, :] - c_feats)    # [q, C, d]
+            dists = np.sum(np.log1p(diffs), axis=2)                    # [q, C]
+
+        # Labels: +1/−1; 0 for invalid candidates
+        future_idx = np.clip(cand_safe + horizon, 0, n - 1)
+        labels = np.where(close_arr[future_idx] > close_arr[cand_safe], 1.0, -1.0)
+        labels[~valid] = 0.0
+        dists[~valid] = 1e10
+        dists[has_nan] = 1e10   # exclude NaN-feature query bars
+
+        # Vectorised top-k vote for all q bars at once
+        n_valid = (dists < 1e9).sum(axis=1)                           # [q]
+        k_safe = min(k, n_cand_max - 1)
+        top_idx = np.argpartition(dists, k_safe, axis=1)[:, :k_safe]  # [q, k]
+        votes_topk = np.take_along_axis(labels, top_idx, axis=1).sum(axis=1)
+        votes_all = labels.sum(axis=1)                                 # [q] (invalid=0)
+
+        votes = np.where(n_valid >= k, votes_topk, votes_all)
+        votes[n_valid == 0] = np.nan
+        votes[has_nan]       = np.nan
+        raw_vote[chunk_start:chunk_end] = votes
 
     entries = np.zeros(n, dtype=bool)
     exits = np.zeros(n, dtype=bool)
 
-    for i in range(max_bars_back, n):
-        if np.any(np.isnan(feat_arr[i])):
-            continue
-
-        # Candidate bars: every 4 bars, within max_bars_back, j >= 4 (need j-4 index)
-        start = max(i - max_bars_back, 4)
-        cand_idx = np.arange(i - 4, start - 1, -4)
-        if len(cand_idx) == 0:
-            continue
-
-        # Filter candidates with valid features
-        hist_feats = feat_arr[cand_idx]
-        valid = ~np.any(np.isnan(hist_feats), axis=1)
-        if not np.any(valid):
-            continue
-        cand_valid = cand_idx[valid]
-        feats_valid = hist_feats[valid]
-
-        # Lorentzian distances (vectorized)
-        diffs = np.abs(feat_arr[i] - feats_valid)     # (n_valid, n_features)
-        distances = np.sum(np.log1p(diffs), axis=1)   # (n_valid,)
-
-        # Labels: sign(close[j] - close[j-4]) — strictly historical
-        labels = np.sign(close_arr[cand_valid] - close_arr[cand_valid - 4])
-
-        # k-nearest vote
-        if len(distances) > k:
-            top_k = np.argpartition(distances, k)[:k]
-            vote = labels[top_k].sum()
-        else:
-            vote = labels.sum()
-
-        # Apply kernel trend filter
-        if use_kernel and i > 0:
-            kernel_bullish = kernel_arr[i] > kernel_arr[i - 1]
-            if vote > 0 and kernel_bullish:
+    if use_kernel:
+        # Rational Quadratic Kernel smoother on the vote series — matches original script
+        vote_filled = np.where(np.isnan(raw_vote), 0.0, raw_vote)
+        smoothed = rational_quadratic_kernel(vote_filled, kernel_lookback, kernel_alpha)
+        # Entry: smoothed crosses above 0; Exit: smoothed crosses below 0
+        for i in range(1, n):
+            if np.isnan(smoothed[i]) or np.isnan(smoothed[i - 1]):
+                continue
+            if smoothed[i] > 0 and smoothed[i - 1] <= 0:
                 entries[i] = True
-            elif vote < 0:
+            elif smoothed[i] < 0 and smoothed[i - 1] >= 0:
                 exits[i] = True
-        else:
-            if vote > 0:
+    else:
+        for i in range(n):
+            if np.isnan(raw_vote[i]):
+                continue
+            if raw_vote[i] > 0:
                 entries[i] = True
-            elif vote < 0:
+            elif raw_vote[i] < 0:
                 exits[i] = True
 
     return pd.Series(entries, index=close.index), pd.Series(exits, index=close.index)
@@ -410,12 +621,40 @@ def compute_signals(strategy: str, close, high=None, low=None, **params):
             atr_ratio_threshold=params.get("atr_ratio_threshold", 1.0),
         )
     elif strategy == "lorentzian_knn":
+        features = params.get("features", "rsi_wt_cci_rsi9_adx")
         return lorentzian_knn_signals(
             close, high, low,
             k=params.get("k", 8),
-            max_bars_back=params.get("max_bars_back", 1000),
-            use_adx=(params.get("features", "") == "rsi_wt_cci_adx"),
-            use_kernel=params.get("use_kernel", False),
+            max_bars_back=params.get("max_bars_back", 2000),
+            use_adx=("adx" in features),
+            use_kernel=params.get("use_kernel", True),
+            kernel_lookback=params.get("kernel_lookback", 8),
+            kernel_alpha=params.get("kernel_alpha", 1.0),
+            horizon=params.get("horizon", 4),
+            sample_step=params.get("sample_step", 4),
+        )
+    elif strategy == "vec_garch_regime":
+        return vec_garch_regime_signals(
+            close, high, low,
+            length=params.get("length", 5),
+            mult=params.get("mult", 1.0),
+            garch_window=params.get("garch_window", 252),
+            vol_percentile=params.get("vol_percentile", 60.0),
+        )
+    elif strategy == "vec_rsi_xgb_regime":
+        return vec_rsi_xgb_regime_signals(
+            close, high, low,
+            length=params.get("length", 15),
+            mult=params.get("mult", 1.0),
+            rsi_window=params.get("rsi_window", 14),
+            rsi_lower=params.get("rsi_lower", 35),
+            rsi_upper=params.get("rsi_upper", 65),
+            atr_ratio_threshold=params.get("atr_ratio_threshold", 0.8),
+            train_window_bars=params.get("train_window_bars", 1080),
+            predict_window_bars=params.get("predict_window_bars", 180),
+            n_estimators=params.get("n_estimators", 100),
+            max_depth=params.get("max_depth", 3),
+            xgb_threshold=params.get("xgb_threshold", 0.50),
         )
     elif strategy == "xgboost":
         from bot.ml_models import xgboost_rolling_signals

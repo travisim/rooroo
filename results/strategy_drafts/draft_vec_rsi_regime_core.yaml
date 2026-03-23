@@ -1,0 +1,67 @@
+id: draft_vec_rsi_regime_core
+version: "1.0"
+created_at: "2026-03-23"
+
+thesis: >
+  In expanding-volatility regimes (ATR5/ATR50 > 0.8), crypto assets exhibit
+  short-term momentum continuation after a bar closes above the prior close plus
+  a volatility band, driven by breakout participation and momentum herding.
+  In contracting-volatility regimes, assets mean-revert as overreaction to
+  recent moves exhausts itself, captured by RSI reaching oversold extremes.
+  A regime-switching overlay routes between VEC breakout and RSI mean-reversion
+  based on the ATR expansion ratio, aiming to deploy each sub-strategy only
+  when its underlying mechanism is active.
+
+entry_family: volatility_breakout
+regime: mixed
+export_ready_v1: false
+
+entry:
+  conditions:
+    - "ATR(5)/ATR(50) ratio computed from Wilder RMA (regime gate)"
+    - "HIGH_VOL path: high > close[1] + SMA(TrueRange, 15) * 1.0 AND atr_ratio > 0.8"
+    - "LOW_VOL path: RSI(14) crosses below 35 AND atr_ratio <= 0.8"
+    - "long-only — no short positions"
+  trend_filter:
+    - "atr_ratio threshold 0.8 acts as implicit volatility regime filter"
+    - "sweep-fitted across 384 parameter combinations on 1 year of 4H data"
+
+exit:
+  signal_exit: "VEC exit (low < close[1] - band) OR RSI exit (RSI crosses above 65) — union"
+  stop_loss_pct: 0.03
+  take_profit_rr: 0.0
+  note: "No take-profit target — relies entirely on signal exit or 3% stop"
+
+risk:
+  position_size_pct: 0.20
+  risk_per_trade: 0.02
+  max_positions: 3
+  assets: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+  note: "3 assets run simultaneously; 20% equity per position; cash-shared"
+
+validation_plan:
+  backtest_period: "2025-03-22 to 2026-03-22 (1 year, 4H bars)"
+  oos_window: "2026-01-22 to 2026-03-22 (last 2 months)"
+  oos_composite: 11.49
+  is_composite: 1.14
+  oos_is_ratio: 10.08
+  concern: >
+    OOS >> IS is atypical and likely reflects a single favourable market
+    window rather than genuine generalisation. Not validated across
+    different market regimes (bear, ranging, low-vol).
+  regime_coverage: "Only 1 year of data — covers partial bull, no bear cycle"
+  cross_regime_validation: false
+
+overfitting_flags:
+  - "4100+ configs swept on 1 year of data (multiple comparison problem)"
+  - "Only 1 of 4100 configs met all three deployment criteria"
+  - "t/d 0.906 barely exceeds 0.9 threshold — likely selected for this reason"
+  - "BTC composite ~0.004 (near-zero) — strategy relies on ETH/SOL 2024-2025 bull market"
+  - "6 sweep-fitted parameters: length=15, mult=1.0, rsi_lower=35, rsi_upper=65, atr_thr=0.8, sl=0.03"
+  - "OOS window is only 2 months and coincides with current favourable regime"
+
+invalidation_signals:
+  - "Live t/d falls below 0.5 per day across all 3 assets over any 14-day window"
+  - "Live max drawdown exceeds 20% (double the backtest 10% typical level)"
+  - "ETH composite turns negative over first 30 days of live trading"
+  - "ATR ratio spends >80% of time in low-vol regime — VEC never fires, RSI dominates at low composite"

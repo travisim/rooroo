@@ -1,0 +1,62 @@
+generated_at_utc: '2026-03-23T01:29:00+00:00'
+source:
+  drafts_dir: /Users/k/Downloads/cody/hypex capital/rooroo/results/strategy_drafts/draft_vec_rsi_regime_core.yaml
+  draft_count: 1
+summary:
+  total: 1
+  PASS: 0
+  REVISE: 1
+  REJECT: 0
+  export_eligible: 0
+reviews:
+- draft_id: draft_vec_rsi_regime_core
+  verdict: REVISE
+  confidence_score: 67
+  export_eligible: false
+  findings:
+  - criterion: C1_edge_plausibility
+    score: 95
+    severity: pass
+    reason: Thesis contains specific causal reasoning.
+    revision_instruction: null
+  - criterion: C2_overfitting_risk
+    score: 80
+    severity: pass
+    reason: 6 filters within acceptable range.
+    revision_instruction: null
+  - criterion: C3_sample_adequacy
+    score: 68
+    severity: pass
+    reason: Estimated 36 annual opportunities.
+    revision_instruction: null
+  - criterion: C4_regime_dependency
+    score: 80
+    severity: pass
+    reason: Single regime (mixed) but cross-regime validation planned.
+    revision_instruction: null
+  - criterion: C5_exit_calibration
+    score: 10
+    severity: fail
+    reason: take_profit_rr=0.0 below 1.5
+    revision_instruction: Tighten stop-loss to <=15% and ensure reward-to-risk >=
+      1.5.
+  - criterion: C6_risk_concentration
+    score: 40
+    severity: warn
+    reason: risk_per_trade=2.0% exceeds 1.5%
+    revision_instruction: Reduce risk_per_trade to <=1.5% and max_positions to <=10.
+  - criterion: C7_execution_realism
+    score: 50
+    severity: warn
+    reason: No volume filter in entry conditions.
+    revision_instruction: Add volume filter (e.g., avg_volume > 500000) for execution
+      realism.
+  - criterion: C8_invalidation_quality
+    score: 80
+    severity: pass
+    reason: 4 invalidation signals defined.
+    revision_instruction: null
+  revision_instructions:
+  - Tighten stop-loss to <=15% and ensure reward-to-risk >= 1.5.
+  - Reduce risk_per_trade to <=1.5% and max_positions to <=10.
+  - Add volume filter (e.g., avg_volume > 500000) for execution realism.

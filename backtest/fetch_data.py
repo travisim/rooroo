@@ -20,8 +20,10 @@ import vectorbtpro as vbt
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
-START_DATE = "2025-03-22"    # 1 year back from today
+# 5s/10s are NOT available via Binance historical REST API (min is 1m).
+# 3m is the smallest practically useful step between 1m and 5m.
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"]
+START_DATE = "2022-03-22"    # 4 years back for rigorous validation
 DATA_DIR = Path(__file__).parent.parent / "data"
 
 BINANCE_BASE = "https://data-api.binance.vision"  # geo-unrestricted
@@ -111,6 +113,13 @@ def fetch_all(force: bool = False):
 
 
 if __name__ == "__main__":
-    force = "--force" in sys.argv
-    fetch_all(force=force)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--timeframes", nargs="+", default=None,
+                        help="Only fetch these timeframes e.g. --timeframes 1h 4h 1d")
+    args = parser.parse_args()
+    if args.timeframes:
+        TIMEFRAMES = args.timeframes
+    fetch_all(force=args.force)
     print("\nDone. Run `conda run -n vbtpro python backtest/sweep.py` next.")
